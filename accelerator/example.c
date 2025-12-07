@@ -35,7 +35,8 @@ void software_convolution(uint32_t *input, uint32_t *output, uint32_t *kernel) {
                     }
 
                     int kernel_idx = (ky + 1) * 3 + (kx + 1);
-                    kernel_val = kernel[kernel_idx];
+                    // [수정] 나중에 음수 가중치 사용 시를 대비해 int로 변환
+                    kernel_val = (int)kernel[kernel_idx];
                     sum += pixel_val * kernel_val;
                 }
             }
@@ -56,9 +57,17 @@ int __attribute__ ((noinline)) timer_count(uint32_t num) {
 
 int main(void)
 {
-    // 필터 정의
+    // =========================================================
+    // [1. 필터 커널 정의]
+    // =========================================================
+    // SW 0: Identity (원본 유지)
     uint32_t kernel_identity[9] = { 0, 0, 0, 0, 1, 0, 0, 0, 0 };
+    
+    // SW 1: Gaussian Blur (부드럽게)
     uint32_t kernel_gaussian[9] = { 1, 2, 1, 2, 4, 2, 1, 2, 1 };
+    
+    // SW 2: Box Blur (평균값 필터 - 새로 추가됨)
+    uint32_t kernel_box[9]      = { 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 
     int i;
     volatile uint32_t val_in, val_out;
@@ -76,14 +85,16 @@ int main(void)
     volatile uint32_t* addr_clear  = (volatile uint32_t*)0x80010008;
     volatile uint32_t* addr_weight = (volatile uint32_t*)0x8001000C;
     
-    // [추가] 상태 레지스터 주소 (13번지 = 0x34)
+    // [상태 레지스터 주소] (13번지 = 0x34)
     volatile uint32_t* addr_status = (volatile uint32_t*)0x80010034;
     
     volatile uint32_t* addr_sw     = ADDR_SWITCHES;
 
-    uwrite_int8s("\r\n=== FPGA Accelerator Demo ===\r\n");
+    uwrite_int8s("\r\n=== FPGA Accelerator Demo (3 Filters) ===\r\n");
     uwrite_int8s("Switch 0 (0->1): Run Identity Filter\r\n");
     uwrite_int8s("Switch 1 (0->1): Run Gaussian Filter\r\n");
+    // [메뉴 추가]
+    uwrite_int8s("Switch 2 (0->1): Run Box Blur Filter\r\n");
 
     uint32_t prev_sw = *addr_sw;
     uint32_t curr_sw;
@@ -93,6 +104,9 @@ int main(void)
     while (1) {
         curr_sw = *addr_sw;
 
+        // =========================================================
+        // [2. 스위치 감지 및 필터 선택 로직]
+        // =========================================================
         if ((curr_sw & 1) && !(prev_sw & 1)) {
             selected_kernel = kernel_identity;
             filter_name = "Identity Filter";
@@ -100,6 +114,11 @@ int main(void)
         else if ((curr_sw & 2) && !(prev_sw & 2)) {
             selected_kernel = kernel_gaussian;
             filter_name = "Gaussian Filter";
+        }
+        // [추가된 로직] 스위치 2번(값 4) 감지 -> Box Blur 선택
+        else if ((curr_sw & 4) && !(prev_sw & 4)) { 
+            selected_kernel = kernel_box;
+            filter_name = "Box Blur Filter";
         }
         else {
             prev_sw = curr_sw;
@@ -110,12 +129,12 @@ int main(void)
         uwrite_int8s(filter_name);
         uwrite_int8s("\r\nSetting Weights...\r\n");
 
-        // 1. 가중치 설정 및 초기화
+        // 3. 가중치 하드웨어에 전송
         *addr_clear = 1;
         for(i=0; i<9; i++) *(addr_weight + i) = selected_kernel[i];
 
         // ---------------------------------------------------------
-        // [STEP 1] 하드웨어 가속기 실행 (Status Check 포함)
+        // [STEP 1] 하드웨어 가속기 실행
         // ---------------------------------------------------------
         COUNTER_RST = 1;
         counter1 = CYCLE_COUNTER;
@@ -125,9 +144,7 @@ int main(void)
             val_in = i % 256;
             *addr_din = val_in;     // 입력
 
-            // [중요] Status Register Polling (Done 신호 확인)
-            // 비트 0이 'Done' 플래그이므로, 1이 될 때까지 대기
-            // "Status Register를 확인하고 데이터를 읽는다"는 조건을 만족함
+            // [중요] Status Register Polling (Done 신호 대기)
             while( (*addr_status & 0x1) == 0 );
 
             val_out = *addr_dout;   // 출력 읽기
@@ -175,7 +192,7 @@ int main(void)
         
         uwrite_int8s("HW Cycles: ");
         uwrite_int8s(uint32_to_ascii_hex(hw_time, buffer, BUF_LEN));
-        uwrite_int8s(" (With Polling)\r\n"); // Polling 시간 포함됨
+        uwrite_int8s(" (With Polling)\r\n");
 
         uwrite_int8s("SW Cycles: ");
         uwrite_int8s(uint32_to_ascii_hex(sw_time, buffer, BUF_LEN));
