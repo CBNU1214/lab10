@@ -164,7 +164,23 @@ module FPGA_TOP #(
 
     assign EXT_HREADYOUT = EXT_HSEL_FF;
     
-    assign EXT_HRDATA = acc_dout;
+// [수정된 코드]
+    // 1. 스위치 값을 읽기 위한 주소 정의 (Index 12 = 0x30 번지)
+    wire is_sw_addr = (EXT_HADDR[5:2] == 4'd12);
+    
+    // 2. 읽기 타이밍 맞추기 (simple_acc와 동일하게 1클럭 지연)
+    reg sw_read_en;
+    always @(posedge cpu_clk_g) begin
+        if (reset_button) sw_read_en <= 1'b0;
+        else sw_read_en <= (EXT_HSEL && !EXT_HWRITE && is_sw_addr);
+    end
+
+    // 3. 스위치 값 동기화 (안정적인 입력을 위해)
+    reg [3:0] sw_safe;
+    always @(posedge cpu_clk_g) sw_safe <= SWITCHES;
+
+    // 4. 데이터 출력 MUX (스위치 주소면 스위치 값, 아니면 가속기 값 출력)
+    assign EXT_HRDATA = (sw_read_en) ? {28'd0, sw_safe} : acc_dout;
         
 
     (* IOB = "true" *) reg fpga_serial_tx_iob;
@@ -178,3 +194,4 @@ module FPGA_TOP #(
    
     
 endmodule
+
