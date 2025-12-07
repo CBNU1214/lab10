@@ -35,7 +35,7 @@ void software_convolution(uint32_t *input, uint32_t *output, uint32_t *kernel) {
                     }
 
                     int kernel_idx = (ky + 1) * 3 + (kx + 1);
-                    // [수정] 나중에 음수 가중치 사용 시를 대비해 int로 변환
+                    // [안전장치] 혹시 모를 음수 가중치 사용을 대비해 int로 변환
                     kernel_val = (int)kernel[kernel_idx];
                     sum += pixel_val * kernel_val;
                 }
@@ -66,10 +66,10 @@ int main(void)
     // SW 1: Gaussian Blur (부드럽게)
     uint32_t kernel_gaussian[9] = { 1, 2, 1, 2, 4, 2, 1, 2, 1 };
     
-    // SW 2: Box Blur (평균값 필터 - 새로 추가됨)
+    // SW 2: Box Blur (평균값 필터)
     uint32_t kernel_box[9]      = { 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 
-    int i;
+    int i, k;
     volatile uint32_t val_in, val_out;
     volatile uint32_t counter1, counter2;
     int8_t buffer[BUF_LEN];
@@ -93,7 +93,6 @@ int main(void)
     uwrite_int8s("\r\n=== FPGA Accelerator Demo (3 Filters) ===\r\n");
     uwrite_int8s("Switch 0 (0->1): Run Identity Filter\r\n");
     uwrite_int8s("Switch 1 (0->1): Run Gaussian Filter\r\n");
-    // [메뉴 추가]
     uwrite_int8s("Switch 2 (0->1): Run Box Blur Filter\r\n");
 
     uint32_t prev_sw = *addr_sw;
@@ -107,15 +106,18 @@ int main(void)
         // =========================================================
         // [2. 스위치 감지 및 필터 선택 로직]
         // =========================================================
+        
+        // 스위치 0번 (값 1)
         if ((curr_sw & 1) && !(prev_sw & 1)) {
             selected_kernel = kernel_identity;
             filter_name = "Identity Filter";
         }
+        // 스위치 1번 (값 2)
         else if ((curr_sw & 2) && !(prev_sw & 2)) {
             selected_kernel = kernel_gaussian;
             filter_name = "Gaussian Filter";
         }
-        // [추가된 로직] 스위치 2번(값 4) 감지 -> Box Blur 선택
+        // 스위치 2번 (값 4) -> Box Blur
         else if ((curr_sw & 4) && !(prev_sw & 4)) { 
             selected_kernel = kernel_box;
             filter_name = "Box Blur Filter";
@@ -132,6 +134,22 @@ int main(void)
         // 3. 가중치 하드웨어에 전송
         *addr_clear = 1;
         for(i=0; i<9; i++) *(addr_weight + i) = selected_kernel[i];
+        
+        // =========================================================
+        // [추가] 선택된 커널 값 출력 (3x3 형태)
+        // =========================================================
+        uwrite_int8s("[Kernel Matrix]\r\n");
+        for(int r = 0; r < 3; r++) {
+            uwrite_int8s("  ");
+            for(int c = 0; c < 3; c++) {
+                uint32_t k_val = selected_kernel[r*3 + c];
+                uwrite_int8s(uint32_to_ascii_hex(k_val, buffer, BUF_LEN));
+                uwrite_int8s("  ");
+            }
+            uwrite_int8s("\r\n");
+        }
+        uwrite_int8s("\r\n");
+        // =========================================================
 
         // ---------------------------------------------------------
         // [STEP 1] 하드웨어 가속기 실행
