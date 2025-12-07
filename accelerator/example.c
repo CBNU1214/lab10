@@ -8,11 +8,11 @@
 #define IMG_HEIGHT 5 // 이미지의 크기 설정
 #define TOTAL_PIXELS (IMG_WIDTH * IMG_HEIGHT)
 
-// 스위치 주소
+// 스위치 주소 (FPGA_TOP에서 12번지 = 0x80010030 매핑됨)
 #define ADDR_SWITCHES ((volatile uint32_t*)0x80010030)
 
 // =================================================================
-// [추가] 소프트웨어 컨볼루션 연산 함수 (비교용)
+// 소프트웨어 컨볼루션 연산 함수 (비교용)
 // =================================================================
 void software_convolution(uint32_t *input, uint32_t *output, uint32_t *kernel) {
     int x, y, kx, ky;
@@ -43,8 +43,8 @@ void software_convolution(uint32_t *input, uint32_t *output, uint32_t *kernel) {
         }
     }
 }
-// =================================================================
 
+// 타이머 함수
 int __attribute__ ((noinline)) timer_count(uint32_t num) {
     uint32_t counter = CYCLE_COUNTER;
     COUNTER_RST = 1;
@@ -65,15 +65,20 @@ int main(void)
     volatile uint32_t counter1, counter2;
     int8_t buffer[BUF_LEN];
 
-    // [중요] 결과를 저장해둘 버퍼 (출력과 계산을 분리하기 위함)
+    // 데이터를 저장할 버퍼
     uint32_t input_buffer[TOTAL_PIXELS];
     uint32_t hw_result_buffer[TOTAL_PIXELS];
     uint32_t sw_result_buffer[TOTAL_PIXELS];
 
+    // 주소 매핑
     volatile uint32_t* addr_din    = (volatile uint32_t*)0x80010000;
     volatile uint32_t* addr_dout   = (volatile uint32_t*)0x80010004;
     volatile uint32_t* addr_clear  = (volatile uint32_t*)0x80010008;
     volatile uint32_t* addr_weight = (volatile uint32_t*)0x8001000C;
+    
+    // [추가] 상태 레지스터 주소 (13번지 = 0x34)
+    volatile uint32_t* addr_status = (volatile uint32_t*)0x80010034;
+    
     volatile uint32_t* addr_sw     = ADDR_SWITCHES;
 
     uwrite_int8s("\r\n=== FPGA Accelerator Demo ===\r\n");
@@ -110,19 +115,24 @@ int main(void)
         for(i=0; i<9; i++) *(addr_weight + i) = selected_kernel[i];
 
         // ---------------------------------------------------------
-        // [STEP 1] 하드웨어 가속기 실행 (순수 연산 시간 측정)
+        // [STEP 1] 하드웨어 가속기 실행 (Status Check 포함)
         // ---------------------------------------------------------
         COUNTER_RST = 1;
         counter1 = CYCLE_COUNTER;
 
-        // 원본 로직과 동일하게 스트리밍하되, 출력 대신 버퍼에 저장
         for(i = 0; i < TOTAL_PIXELS + 10; i++)
         {
             val_in = i % 256;
             *addr_din = val_in;     // 입력
-            val_out = *addr_dout;   // 출력
 
-            // 64개 픽셀만 버퍼에 저장
+            // [중요] Status Register Polling (Done 신호 확인)
+            // 비트 0이 'Done' 플래그이므로, 1이 될 때까지 대기
+            // "Status Register를 확인하고 데이터를 읽는다"는 조건을 만족함
+            while( (*addr_status & 0x1) == 0 );
+
+            val_out = *addr_dout;   // 출력 읽기
+
+            // 유효 픽셀만 버퍼에 저장
             if (i < TOTAL_PIXELS) {
                 input_buffer[i] = val_in;
                 hw_result_buffer[i] = val_out;
@@ -133,7 +143,7 @@ int main(void)
         uint32_t hw_time = counter2 - counter1;
 
         // ---------------------------------------------------------
-        // [STEP 2] 소프트웨어 실행 (순수 연산 시간 측정)
+        // [STEP 2] 소프트웨어 실행
         // ---------------------------------------------------------
         COUNTER_RST = 1;
         counter1 = CYCLE_COUNTER;
@@ -144,7 +154,7 @@ int main(void)
         uint32_t sw_time = counter2 - counter1;
 
         // ---------------------------------------------------------
-        // [STEP 3] 결과 값 64개 출력 (기존 기능 복구)
+        // [STEP 3] 결과 값 출력
         // ---------------------------------------------------------
         uwrite_int8s("\r\n--- 25 Pixel Results ---\r\n");
         for (i = 0; i < TOTAL_PIXELS; i++) {
@@ -158,14 +168,14 @@ int main(void)
         }
 
         // ---------------------------------------------------------
-        // [STEP 4] 속도 비교 결과 출력 (추가된 기능)
+        // [STEP 4] 속도 비교 결과 출력
         // ---------------------------------------------------------
         uwrite_int8s("--------------------------------\r\n");
         uwrite_int8s("Performance Comparison (Cycles):\r\n");
         
         uwrite_int8s("HW Cycles: ");
         uwrite_int8s(uint32_to_ascii_hex(hw_time, buffer, BUF_LEN));
-        uwrite_int8s(" (Fast!)\r\n");
+        uwrite_int8s(" (With Polling)\r\n"); // Polling 시간 포함됨
 
         uwrite_int8s("SW Cycles: ");
         uwrite_int8s(uint32_to_ascii_hex(sw_time, buffer, BUF_LEN));
