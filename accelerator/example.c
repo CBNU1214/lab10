@@ -4,221 +4,186 @@
 #include "uart.h"
 
 #define BUF_LEN 128
-#define IMG_WIDTH 5  // 이미지의 크기 설정
-#define IMG_HEIGHT 5 // 이미지의 크기 설정
-#define TOTAL_PIXELS (IMG_WIDTH * IMG_HEIGHT)
+#define DATA_SIZE 100 
 
-// 스위치 주소 (FPGA_TOP에서 12번지 = 0x80010030 매핑됨)
-#define ADDR_SWITCHES ((volatile uint32_t*)0x80010030)
+typedef void (*entry_t)(void);
 
-// =================================================================
-// 소프트웨어 컨볼루션 연산 함수 (비교용)
-// =================================================================
-void software_convolution(uint32_t *input, uint32_t *output, uint32_t *kernel) {
-    int x, y, kx, ky;
-    int kernel_val, pixel_val;
-    
-    for (y = 0; y < IMG_HEIGHT; y++) {
-        for (x = 0; x < IMG_WIDTH; x++) {
-            uint32_t sum = 0;
-            for (ky = -1; ky <= 1; ky++) {
-                for (kx = -1; kx <= 1; kx++) {
-                    int neighbor_x = x + kx;
-                    int neighbor_y = y + ky;
+// =============================================================
+// 1. Accelerator Address Mapping
+// =============================================================
+volatile uint32_t* addr_din   = (volatile uint32_t*)0x80010000;
+volatile uint32_t* addr_dout  = (volatile uint32_t*)0x80010004;
+volatile uint32_t* addr_clear = (volatile uint32_t*)0x80010008;
+volatile uint32_t* addr_w0    = (volatile uint32_t*)0x8001000C;
+volatile uint32_t* addr_w1    = (volatile uint32_t*)0x80010010;
+volatile uint32_t* addr_w2    = (volatile uint32_t*)0x80010014;
+volatile uint32_t* addr_sw    = (volatile uint32_t*)0x80010018; 
+volatile uint32_t* addr_led   = (volatile uint32_t*)0x8001001C; 
 
-                    // Zero Padding
-                    if (neighbor_x < 0 || neighbor_x >= IMG_WIDTH || 
-                        neighbor_y < 0 || neighbor_y >= IMG_HEIGHT) {
-                        pixel_val = 0;
-                    } else {
-                        pixel_val = input[neighbor_y * IMG_WIDTH + neighbor_x];
-                    }
-
-                    int kernel_idx = (ky + 1) * 3 + (kx + 1);
-                    // [안전장치] 혹시 모를 음수 가중치 사용을 대비해 int로 변환
-                    kernel_val = (int)kernel[kernel_idx];
-                    sum += pixel_val * kernel_val;
-                }
-            }
-            output[y * IMG_WIDTH + x] = sum;
-        }
-    }
-}
-
-// 타이머 함수
-int __attribute__ ((noinline)) timer_count(uint32_t num) {
-    uint32_t counter = CYCLE_COUNTER;
-    COUNTER_RST = 1;
-    uint32_t temp;
-    for(int i = 0 ; i < num ; i ++) temp = CYCLE_COUNTER;
-    counter -= temp;
-    return counter;
+// =============================================================
+// 2. Helper Functions
+// =============================================================
+void delay_loop(uint32_t count) {
+    volatile uint32_t i;
+    for (i = 0; i < count; i++);
 }
 
 int main(void)
 {
-    // =========================================================
-    // [1. 필터 커널 정의]
-    // =========================================================
-    // SW 0: Identity (원본 유지)
-    uint32_t kernel_identity[9] = { 0, 0, 0, 0, 1, 0, 0, 0, 0 };
-    
-    // SW 1: Gaussian Blur (부드럽게)
-    uint32_t kernel_gaussian[9] = { 1, 2, 1, 2, 4, 2, 1, 2, 1 };
-    
-    // SW 2: Box Blur (평균값 필터)
-    uint32_t kernel_box[9]      = { 1, 1, 1, 1, 1, 1, 1, 1, 1 };
-
-    int i, k;
-    volatile uint32_t val_in, val_out;
-    volatile uint32_t counter1, counter2;
+    uint32_t data[DATA_SIZE];
+    uint32_t hw_result[DATA_SIZE];
+    uint32_t sw_result[DATA_SIZE];
+    uint32_t seed = 0x12345678;
     int8_t buffer[BUF_LEN];
+    uint32_t i;
+    volatile uint32_t counter_start, counter_end;
+    uint32_t hw_cycles, sw_cycles;
 
-    // 데이터를 저장할 버퍼
-    uint32_t input_buffer[TOTAL_PIXELS];
-    uint32_t hw_result_buffer[TOTAL_PIXELS];
-    uint32_t sw_result_buffer[TOTAL_PIXELS];
+    // ---------------------------------------------------------
+    // 커널 정의 (4가지 모드)
+    // ---------------------------------------------------------
+    uint32_t k_mode0[3] = { 1, 2, 1 };                       // SW0: Smoothing
+    uint32_t k_mode1[3] = { (uint32_t)-1, 2, (uint32_t)-1 }; // SW1: Edge Detection
+    uint32_t k_mode2[3] = { 0, 1, 0 };                       // SW2: Identity
+    uint32_t k_mode3[3] = { 1, 0, (uint32_t)-1 };            // SW3: Gradient
 
-    // 주소 매핑
-    volatile uint32_t* addr_din    = (volatile uint32_t*)0x80010000;
-    volatile uint32_t* addr_dout   = (volatile uint32_t*)0x80010004;
-    volatile uint32_t* addr_clear  = (volatile uint32_t*)0x80010008;
-    volatile uint32_t* addr_weight = (volatile uint32_t*)0x8001000C;
+    uint32_t* k_selected = 0; 
+    char* mode_name = "";
+
+    // [변경점 1] 여기서 데이터를 미리 생성하지 않고 루프 안으로 옮깁니다.
     
-    // [상태 레지스터 주소] (13번지 = 0x34)
-    volatile uint32_t* addr_status = (volatile uint32_t*)0x80010034;
-    
-    volatile uint32_t* addr_sw     = ADDR_SWITCHES;
+    uwrite_int8s("\r\n==========================================\r\n");
+    uwrite_int8s("   4-Switch Kernel Selector Demo          \r\n");
+    uwrite_int8s("   SW[0]..SW[3] selects specific Kernel   \r\n");
+    uwrite_int8s("==========================================\r\n");
 
-    uwrite_int8s("\r\n=== FPGA Accelerator Demo (3 Filters) ===\r\n");
-    uwrite_int8s("Switch 0 (0->1): Run Identity Filter\r\n");
-    uwrite_int8s("Switch 1 (0->1): Run Gaussian Filter\r\n");
-    uwrite_int8s("Switch 2 (0->1): Run Box Blur Filter\r\n");
+    uint32_t prev_switch_val = 0xFFFFFFFF; 
 
-    uint32_t prev_sw = *addr_sw;
-    uint32_t curr_sw;
-    uint32_t *selected_kernel = 0;
-    char *filter_name = "";
+    while (1) 
+    {
+        uint32_t raw_sw = *addr_sw;
+        uint32_t current_sw = raw_sw & 0xF; 
 
-    while (1) {
-        curr_sw = *addr_sw;
-
-        // =========================================================
-        // [2. 스위치 감지 및 필터 선택 로직]
-        // =========================================================
-        
-        // 스위치 0번 (값 1)
-        if ((curr_sw & 1) && !(prev_sw & 1)) {
-            selected_kernel = kernel_identity;
-            filter_name = "Identity Filter";
-        }
-        // 스위치 1번 (값 2)
-        else if ((curr_sw & 2) && !(prev_sw & 2)) {
-            selected_kernel = kernel_gaussian;
-            filter_name = "Gaussian Filter";
-        }
-        // 스위치 2번 (값 4) -> Box Blur
-        else if ((curr_sw & 4) && !(prev_sw & 4)) { 
-            selected_kernel = kernel_box;
-            filter_name = "Box Blur Filter";
-        }
-        else {
-            prev_sw = curr_sw;
-            continue;
-        }
-
-        uwrite_int8s("\r\n[Selected]: ");
-        uwrite_int8s(filter_name);
-        uwrite_int8s("\r\nSetting Weights...\r\n");
-
-        // 3. 가중치 하드웨어에 전송
-        *addr_clear = 1;
-        for(i=0; i<9; i++) *(addr_weight + i) = selected_kernel[i];
-        
-        // =========================================================
-        // [추가] 선택된 커널 값 출력 (3x3 형태)
-        // =========================================================
-        uwrite_int8s("[Kernel Matrix]\r\n");
-        for(int r = 0; r < 3; r++) {
-            uwrite_int8s("  ");
-            for(int c = 0; c < 3; c++) {
-                uint32_t k_val = selected_kernel[r*3 + c];
-                uwrite_int8s(uint32_to_ascii_hex(k_val, buffer, BUF_LEN));
-                uwrite_int8s("  ");
-            }
-            uwrite_int8s("\r\n");
-        }
-        uwrite_int8s("\r\n");
-        // =========================================================
-
-        // ---------------------------------------------------------
-        // [STEP 1] 하드웨어 가속기 실행
-        // ---------------------------------------------------------
-        COUNTER_RST = 1;
-        counter1 = CYCLE_COUNTER;
-
-        for(i = 0; i < TOTAL_PIXELS + 10; i++)
+        if (current_sw != prev_switch_val) 
         {
-            val_in = i % 256;
-            *addr_din = val_in;     // 입력
+            delay_loop(100000); 
+            raw_sw = *addr_sw;
+            current_sw = raw_sw & 0xF;
 
-            // [중요] Status Register Polling (Done 신호 대기)
-            while( (*addr_status & 0x1) == 0 );
+            // LED 제어
+            *addr_led = current_sw; 
 
-            val_out = *addr_dout;   // 출력 읽기
+            int valid_selection = 0;
 
-            // 유효 픽셀만 버퍼에 저장
-            if (i < TOTAL_PIXELS) {
-                input_buffer[i] = val_in;
-                hw_result_buffer[i] = val_out;
+            if (current_sw == 0) {
+                uwrite_int8s("\r\n[IDLE] All switches OFF. Standing by...\r\n");
             }
+            else {
+                if (current_sw & 0x1) {      // SW 0
+                    k_selected = k_mode0;
+                    mode_name = "SW0: Smoothing (1, 2, 1)";
+                    valid_selection = 1;
+                }
+                else if (current_sw & 0x2) { // SW 1
+                    k_selected = k_mode1;
+                    mode_name = "SW1: Edge Detect (-1, 2, -1)";
+                    valid_selection = 1;
+                }
+                else if (current_sw & 0x4) { // SW 2
+                    k_selected = k_mode2;
+                    mode_name = "SW2: Identity (0, 1, 0)";
+                    valid_selection = 1;
+                }
+                else if (current_sw & 0x8) { // SW 3
+                    k_selected = k_mode3;
+                    mode_name = "SW3: Gradient (1, 0, -1)";
+                    valid_selection = 1;
+                }
+            }
+
+            if (valid_selection) 
+            {
+                // =========================================================
+                // [핵심 변경점] 새로운 입력 데이터 생성 (New Random Input)
+                // =========================================================
+                
+                // 1. 현재 하드웨어 사이클 카운터(시간)를 시드에 섞음 (누르는 타이밍에 따라 달라짐)
+                seed ^= CYCLE_COUNTER; 
+
+                // 2. 새로운 난수 데이터 생성
+                for (i = 0; i < DATA_SIZE; i++) {
+                    seed = seed * 1664525 + 1013904223;
+                    data[i] = seed >> 16; 
+                }
+                
+                uwrite_int8s("\r\n------------------------------------------\r\n");
+                uwrite_int8s("[INFO] New Random Data Generated!\r\n"); // 알림 메시지 추가
+                uwrite_int8s("Running Mode -> ");
+                uwrite_int8s((int8_t*)mode_name);
+                uwrite_int8s("\r\n");
+
+                // --- HW 실행 ---
+                COUNTER_RST = 1;
+                counter_start = CYCLE_COUNTER;
+
+                *addr_clear = 1; 
+                *addr_w0 = k_selected[0]; 
+                *addr_w1 = k_selected[1]; 
+                *addr_w2 = k_selected[2];
+
+                for (i = 0; i < DATA_SIZE; i++) {
+                    *addr_din = data[i];     
+                    hw_result[i] = *addr_dout; 
+                }
+                counter_end = CYCLE_COUNTER;
+                hw_cycles = counter_end - counter_start;
+
+                // --- SW 실행 ---
+                COUNTER_RST = 1;
+                counter_start = CYCLE_COUNTER;
+
+                uint32_t x0, x1 = 0, x2 = 0;
+                for (i = 0; i < DATA_SIZE; i++) {
+                    x0 = data[i];
+                    sw_result[i] = (x0 * k_selected[0]) + (x1 * k_selected[1]) + (x2 * k_selected[2]);
+                    x2 = x1; x1 = x0;
+                }
+                counter_end = CYCLE_COUNTER;
+                sw_cycles = counter_end - counter_start;
+
+                // --- 결과 출력 ---
+                int error_count = 0;
+                uwrite_int8s("[Idx]   [Input]     [HW Out]    [SW Out]\r\n");
+                
+                for (i = 0; i < DATA_SIZE; i++) {
+                    if (hw_result[i] != sw_result[i]) error_count++;
+                    
+                    if (i < 5) { 
+                        uwrite_int8s(" ");
+                        uwrite_int8s(uint32_to_ascii_hex(i, buffer, BUF_LEN));
+                        uwrite_int8s("    ");
+                        uwrite_int8s(uint32_to_ascii_hex(data[i], buffer, BUF_LEN));
+                        uwrite_int8s("    ");
+                        uwrite_int8s(uint32_to_ascii_hex(hw_result[i], buffer, BUF_LEN));
+                        uwrite_int8s("    ");
+                        uwrite_int8s(uint32_to_ascii_hex(sw_result[i], buffer, BUF_LEN));
+                        uwrite_int8s("\r\n");
+                    }
+                }
+
+                if (error_count == 0) uwrite_int8s("Result: SUCCESS\r\n");
+                else                  uwrite_int8s("Result: FAIL\r\n");
+                
+                uwrite_int8s("Cycles - HW: ");
+                uwrite_int8s(uint32_to_ascii_hex(hw_cycles, buffer, BUF_LEN));
+                uwrite_int8s(", SW: ");
+                uwrite_int8s(uint32_to_ascii_hex(sw_cycles, buffer, BUF_LEN));
+                uwrite_int8s("\r\n");
+            }
+
+            prev_switch_val = current_sw;
         }
-        
-        counter2 = CYCLE_COUNTER;
-        uint32_t hw_time = counter2 - counter1;
-
-        // ---------------------------------------------------------
-        // [STEP 2] 소프트웨어 실행
-        // ---------------------------------------------------------
-        COUNTER_RST = 1;
-        counter1 = CYCLE_COUNTER;
-        
-        software_convolution(input_buffer, sw_result_buffer, selected_kernel);
-
-        counter2 = CYCLE_COUNTER;
-        uint32_t sw_time = counter2 - counter1;
-
-        // ---------------------------------------------------------
-        // [STEP 3] 결과 값 출력
-        // ---------------------------------------------------------
-        uwrite_int8s("\r\n--- 25 Pixel Results ---\r\n");
-        for (i = 0; i < TOTAL_PIXELS; i++) {
-            uwrite_int8s("idx: ");
-            uwrite_int8s(uint32_to_ascii_hex(i, buffer, BUF_LEN));
-            uwrite_int8s(" | In: ");
-            uwrite_int8s(uint32_to_ascii_hex(input_buffer[i], buffer, BUF_LEN));
-            uwrite_int8s(" -> Out: ");
-            uwrite_int8s(uint32_to_ascii_hex(hw_result_buffer[i], buffer, BUF_LEN));
-            uwrite_int8s("\r\n");
-        }
-
-        // ---------------------------------------------------------
-        // [STEP 4] 속도 비교 결과 출력
-        // ---------------------------------------------------------
-        uwrite_int8s("--------------------------------\r\n");
-        uwrite_int8s("Performance Comparison (Cycles):\r\n");
-        
-        uwrite_int8s("HW Cycles: ");
-        uwrite_int8s(uint32_to_ascii_hex(hw_time, buffer, BUF_LEN));
-        uwrite_int8s(" (With Polling)\r\n");
-
-        uwrite_int8s("SW Cycles: ");
-        uwrite_int8s(uint32_to_ascii_hex(sw_time, buffer, BUF_LEN));
-        uwrite_int8s("\r\n");
-        
-        uwrite_int8s("Done. Waiting for switch toggle...\r\n");
-
-        prev_sw = curr_sw;
     }
+    
     return 0;
 }
