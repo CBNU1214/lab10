@@ -3,9 +3,13 @@
 module FPGA_TOP #(
     parameter SYSTEM_CLOCK_FREQ = 100_000_000,
     parameter BAUD_RATE = 115200,
+    // Warning: changing the CPU_CLOCK_FREQ parameter doesn't actually change the clock frequency coming out of the PLL
     parameter CPU_CLOCK_FREQ = 50_000_000,
+    // Sample the button signal every 500us
     parameter integer B_SAMPLE_COUNT_MAX = 0.0005 * CPU_CLOCK_FREQ,
+    // The button is considered 'pressed' after 100ms of continuous pressing
     parameter integer B_PULSE_COUNT_MAX = 0.100 / 0.0005,
+    // The PC the RISC-V CPU should start at after reset
     parameter RESET_PC = 32'h4000_0000
 ) (
     input wire CLK100MHZ,
@@ -53,7 +57,7 @@ module FPGA_TOP #(
     /* verilator lint_off PINMISSING */
     PLLE2_ADV #(
         .BANDWIDTH            ("OPTIMIZED"),
-        .COMPENSATION         ("BUF_IN"),  
+        .COMPENSATION         ("BUF_IN"),  // Not "ZHOLD"
         .STARTUP_WAIT         ("FALSE"),
         .DIVCLK_DIVIDE        (4),
         .CLKFBOUT_MULT        (34),
@@ -65,14 +69,20 @@ module FPGA_TOP #(
     ) plle2_cpu_inst (
         .CLKFBOUT            (cpu_clk_pll_fb_out),
         .CLKOUT0             (cpu_clk),
+        // Input clock control
         .CLKFBIN             (cpu_clk_pll_fb_in),
         .CLKIN1              (clk),
         .CLKIN2              (1'b0),
+        // Tied to always select the primary input clock
         .CLKINSEL            (1'b1),
+        // Other control and status signals
         .LOCKED              (cpu_clk_pll_lock),
         .PWRDWN              (1'b0),
         .RST                 (1'b0)
     );
+
+    // The global system reset is asserted when the RESET button is
+    // pressed by the user or when the PLL isn't locked
 
     wire [3:0] button_parsed;
     wire reset_button, reset;
@@ -117,15 +127,15 @@ module FPGA_TOP #(
     assign EXT_BE[3]    = (EXT_HSIZE == 3'b010 && EXT_HADDR[1:0] == 2'b00) 
                         || (EXT_HSIZE == 3'b001 && EXT_HADDR[1:0] == 2'b10)
                         || (EXT_HSIZE == 3'b000 && EXT_HADDR[1:0] == 2'b11);
-    assign EXT_BE[2]    = (EXT_HSIZE == 3'b010 && EXT_HADDR[1:0] == 2'b00) 
+    assign EXT_BE[2]    = (EXT_HSIZE == 3'b010 && EXT_HADDR[1:0] == 2'b00)
                         || (EXT_HSIZE == 3'b001 && EXT_HADDR[1:0] == 2'b01)
                         || (EXT_HSIZE == 3'b001 && EXT_HADDR[1:0] == 2'b10)
                         || (EXT_HSIZE == 3'b000 && EXT_HADDR[1:0] == 2'b10);
-    assign EXT_BE[1]    = (EXT_HSIZE == 3'b010 && EXT_HADDR[1:0] == 2'b00) 
+    assign EXT_BE[1]    = (EXT_HSIZE == 3'b010 && EXT_HADDR[1:0] == 2'b00)
                         || (EXT_HSIZE == 3'b001 && EXT_HADDR[1:0] == 2'b00)
                         || (EXT_HSIZE == 3'b001 && EXT_HADDR[1:0] == 2'b01)
                         || (EXT_HSIZE == 3'b000 && EXT_HADDR[1:0] == 2'b01);
-    assign EXT_BE[0]    = (EXT_HSIZE == 3'b010 && EXT_HADDR[1:0] == 2'b00) 
+    assign EXT_BE[0]    = (EXT_HSIZE == 3'b010 && EXT_HADDR[1:0] == 2'b00)
                         || (EXT_HSIZE == 3'b001 && EXT_HADDR[1:0] == 2'b00)
                         || (EXT_HSIZE == 3'b000 && EXT_HADDR[1:0] == 2'b00);
     
@@ -134,10 +144,7 @@ module FPGA_TOP #(
     PipeReg #(16) FF_EXT_ADDR (.CLK(cpu_clk_g), .RST(reset_button), .EN(1'b1), .D(EXT_HADDR), .Q(EXT_HADDR_FF));
     PipeReg #(4) FF_EXT_BE (.CLK(cpu_clk_g), .RST(reset_button), .EN(1'b1), .D(EXT_BE), .Q(EXT_BE_FF));
     
-    // [중요] 와이어 이름 확인: out
-    wire [3:0] acc_leds_out;
-    
-    assign LEDS = acc_leds_out;
+    assign LEDS = 4'b1010;
     
     simple_acc u_simple_acc (
         .clk(cpu_clk_g),
@@ -146,11 +153,6 @@ module FPGA_TOP #(
         .en(acc_en),
         .we(acc_we),
         .din(acc_din),
-        .switches(SWITCHES),
-        
-        // [중요 수정됨] ouy -> out (이제 정상)
-        .leds(acc_leds_out),
-        
         .dout(acc_dout)
     );
     
@@ -158,11 +160,13 @@ module FPGA_TOP #(
     assign acc_en   = EXT_HSEL;
     assign acc_we   = EXT_HWRITE_FF;
     assign acc_din  = EXT_HWDATA;
+ 
 
     assign EXT_HREADYOUT = EXT_HSEL_FF;
     
     assign EXT_HRDATA = acc_dout;
         
+
     (* IOB = "true" *) reg fpga_serial_tx_iob;
     (* IOB = "true" *) reg fpga_serial_rx_iob;
     assign FPGA_SERIAL_TX = fpga_serial_tx_iob;
@@ -171,5 +175,6 @@ module FPGA_TOP #(
         fpga_serial_tx_iob <= cpu_tx;
         fpga_serial_rx_iob <= FPGA_SERIAL_RX;
     end
+   
     
 endmodule
